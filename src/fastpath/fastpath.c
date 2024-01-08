@@ -902,3 +902,261 @@ void NORETURN fastpath_vm_fault(vm_fault_type_t type)
     fastpath_restore(badge, msgInfo, NODE_STATE(ksCurThread));
 }
 #endif
+
+#ifdef CONFIG_IRQ_FASTPATH
+#ifdef CONFIG_ARCH_ARM
+static inline
+FORCE_INLINE
+#endif
+void NORETURN fastpath_irq()
+{
+
+    sched_context_t *sc = NULL;
+    bool_t schedulable = false;
+    bool_t crossnode = false;
+    bool_t idle = false;
+    tcb_t *dest = NULL;
+    cap_t newVTable;
+    vspace_root_t *cap_pd;
+    pde_t stored_hw_asid;
+
+    /* The IRQ should be passed as a parameter to this fn. At the moment, if the
+    slowpath is called, calls getActiveIRQ again in handleInterruptEntry.
+    Syscall API change to handleInterruptEntry will be done in another commit. */
+    irq_t irq = getActiveIRQ();
+
+    /* check the irq is valid */
+    if (unlikely(IRQT_TO_IRQ(irq) == IRQT_TO_IRQ(irqInvalid))) {
+        if (config_set(CONFIG_IRQ_REPORTING)) {
+            printf("Spurious interrupt\n");
+        }
+        handleSpuriousIRQ();
+        restore_user_context();
+        UNREACHABLE();
+    }
+
+    if (unlikely(IRQT_TO_IRQ(irq) > maxIRQ)) {
+        maskInterrupt(true, irq);
+        ackInterrupt(irq);
+        restore_user_context();
+        UNREACHABLE();
+    }
+
+    /* only fastpath signalling IRQs*/
+    if (unlikely(intStateIRQTable[IRQT_TO_IDX(irq)] != IRQSignal)) {
+        slowpath_irq();
+        UNREACHABLE();
+    }
+
+    cap_t ntfn_cap = intStateIRQNode[IRQT_TO_IDX(irq)].cap;
+    if (unlikely(cap_get_capType(ntfn_cap) != cap_notification_cap ||
+                !cap_notification_cap_get_capNtfnCanSend(ntfn_cap))) {
+#ifdef CONFIG_IRQ_REPORTING
+        printf("Undelivered irq: %d\n", (int) IRQT_TO_IRQ(irq));
+#endif
+        maskInterrupt(true, irq);
+        ackInterrupt(irq);
+        restore_user_context();
+        UNREACHABLE();
+    }
+
+    notification_t *ntfn_ptr = NTFN_PTR(cap_notification_cap_get_capNtfnPtr(ntfn_cap));
+    notification_state_t ntfn_state = notification_ptr_get_state(ntfn_ptr);
+    word_t badge = cap_notification_cap_get_capNtfnBadge(ntfn_cap);
+
+    switch (ntfn_state) {
+    case NtfnState_Active:
+#ifdef CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES
+        ksKernelEntry.is_fastpath = true;
+#endif
+        ntfn_set_active(ntfn_ptr, badge | notification_ptr_get_ntfnMsgIdentifier(ntfn_ptr));
+        maskInterrupt(true, irq);
+        ackInterrupt(irq);
+        restore_user_context();
+        UNREACHABLE();
+    case NtfnState_Idle:
+        dest = (tcb_t *) notification_ptr_get_ntfnBoundTCB(ntfn_ptr);
+
+        if (!dest || thread_state_ptr_get_tsType(&dest->tcbState) != ThreadState_BlockedOnReceive) {
+#ifdef CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES
+            ksKernelEntry.is_fastpath = true;
+#endif
+            ntfn_set_active(ntfn_ptr, badge);
+            maskInterrupt(true, irq);
+            ackInterrupt(irq);
+            restore_user_context();
+            UNREACHABLE();
+        }
+
+        idle = true;
+        break;
+    case NtfnState_Waiting:
+        dest = TCB_PTR(notification_ptr_get_ntfnQueue_head(ntfn_ptr));
+        break;
+    default:
+        fail("Invalid notification state");
+    }
+
+    /* at this point we know we're going to have to switch threads */
+    assert(dest != NULL);
+
+     /* Get the bound SC of the signalled thread */
+    sc = dest->tcbSchedContext;
+
+    /* If the signalled thread doesn't have a bound SC, check if one can be
+     * donated from the notification. If not, go to the slowpath */
+    if (!sc || dest->tcbSchedContext->scRefillMax == 0) {
+        sc = SC_PTR(notification_ptr_get_ntfnSchedContext(ntfn_ptr));
+        if (sc == NULL || sc->scTcb != NULL) {
+            slowpath_irq();
+            UNREACHABLE();
+        }
+
+        /* Slowpath the case where dest has its FPU context in the FPU of a core*/
+#if defined(ENABLE_SMP_SUPPORT) && defined(CONFIG_HAVE_FPU)
+        if (nativeThreadUsingFPU(dest)) {
+            slowpath_irq();
+            UNREACHABLE();
+        }
+#endif
+    }
+
+    if (sc->scRefillMax > 0) {
+        if (!(refill_ready(sc) && refill_sufficient(sc, 0))) {
+            slowpath_irq();
+        }
+        schedulable = true;
+    }
+
+
+    /*  Point of no return */
+#ifdef CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES
+    ksKernelEntry.is_fastpath = true;
+#endif
+
+    if (SMP_TERNARY(clh_is_self_in_queue(), 1)) {
+        updateTimestamp();
+        checkBudget();
+    }
+
+    if (idle) {
+        /* Cancel the IPC that the signalled thread is waiting on */
+        cancelIPC_fp(dest);
+    } else {
+        /* Dequeue dest from the notification queue */
+        ntfn_queue_dequeue_fp(dest, ntfn_ptr);
+    }
+
+    /* Wake up the signalled thread and tranfer badge */
+    setRegister(dest, badgeRegister, badge);
+    thread_state_ptr_set_tsType_np(&dest->tcbState, ThreadState_Running);
+
+    /* Donate SC if necessary. The checks for this were already done before
+     * the point of no return */
+    maybeDonateSchedContext_fp(dest, sc);
+
+    /* Left this in the same form as the slowpath. Not sure if optimal */
+    if (sc_sporadic(dest->tcbSchedContext)) {
+        assert(dest->tcbSchedContext != NODE_STATE(ksCurSC));
+        if (dest->tcbSchedContext != NODE_STATE(ksCurSC)) {
+            refill_unblock_check(dest->tcbSchedContext);
+        }
+    }
+
+    if (!schedulable) {
+        maskInterrupt(true, irq);
+        ackInterrupt(irq);
+        restore_user_context();
+        UNREACHABLE();
+    }
+
+    if (ksCurDomain != dest->tcbDomain SMP_COND_STATEMENT( || sc->scCore != getCurrentCPUIndex())) {
+        crossnode = true;
+    }
+
+    if (NODE_STATE(ksCurThread)->tcbPriority < dest->tcbPriority && !crossnode) {
+
+        /* Get destination thread.*/
+        newVTable = TCB_PTR_CTE_PTR(dest, tcbVTable)->cap;
+
+        /* Get vspace root. */
+        cap_pd = cap_vtable_cap_get_vspace_root_fp(newVTable);
+
+        /* Ensure that the destination has a valid VTable. */
+        if (unlikely(! isValidVTableRoot_fp(newVTable))) {
+            slowpath_irq();
+        }
+
+#ifdef CONFIG_ARCH_AARCH32
+        /* Get HW ASID */
+        stored_hw_asid = cap_pd[PD_ASID_SLOT];
+#endif
+
+#ifdef CONFIG_ARCH_X86_64
+        /* borrow the stored_hw_asid for PCID */
+        stored_hw_asid.words[0] = cap_pml4_cap_get_capPML4MappedASID_fp(newVTable);
+#endif
+
+#ifdef CONFIG_ARCH_IA32
+        /* stored_hw_asid is unused on ia32 fastpath, but gets passed into a function below. */
+        stored_hw_asid.words[0] = 0;
+#endif
+#ifdef CONFIG_ARCH_AARCH64
+        /* Need to test that the ASID is still valid */
+        asid_t asid = cap_vspace_cap_get_capVSMappedASID(newVTable);
+        asid_map_t asid_map = findMapForASID(asid);
+        if (unlikely(asid_map_get_type(asid_map) != asid_map_asid_map_vspace ||
+                    VSPACE_PTR(asid_map_asid_map_vspace_get_vspace_root(asid_map)) != cap_pd)) {
+            slowpath_irq();
+        }
+#ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
+        /* Ensure the vmid is valid. */
+        if (unlikely(!asid_map_asid_map_vspace_get_stored_vmid_valid(asid_map))) {
+            slowpath_irq();
+        }
+        /* vmids are the tags used instead of hw_asids in hyp mode */
+        stored_hw_asid.words[0] = asid_map_asid_map_vspace_get_stored_hw_vmid(asid_map);
+#else
+        stored_hw_asid.words[0] = asid;
+#endif
+#endif
+
+#ifdef CONFIG_ARCH_RISCV
+        /* Get HW ASID */
+        stored_hw_asid.words[0] = cap_page_table_cap_get_capPTMappedASID(newVTable);
+#endif
+
+        /* we're going to switch threads - charge the current thread */
+        ticks_t prev = getNextInterrupt();
+        /* charge the previous thread */
+        if (checkBudget()) {
+            commitTime();
+        }
+
+        if (isSchedulable(NODE_STATE(ksCurThread))) {
+            SCHED_ENQUEUE_CURRENT_TCB;
+        }
+        switchToThread_fp(dest, cap_pd, stored_hw_asid);
+        /* only set the next irq if we really have to */
+        ticks_t next = getNextInterrupt();
+        if (next < prev) {
+            setDeadline(next - getTimerPrecision());
+        }
+        /* update sc */
+        NODE_STATE(ksCurSC) = NODE_STATE(ksCurThread)->tcbSchedContext;
+    } else {
+        assert(isSchedulable(dest));
+        SCHED_APPEND(dest);
+    }
+
+#ifdef ENABLE_SMP_SUPPORT
+    doMaskReschedule(ARCH_NODE_STATE(ipiReschedulePending));
+    ARCH_NODE_STATE(ipiReschedulePending) = 0;
+#endif /* ENABLE_SMP_SUPPORT */
+
+    maskInterrupt(true, irq);
+    ackInterrupt(irq);
+    restore_user_context();
+    UNREACHABLE();
+}
+#endif
