@@ -101,7 +101,8 @@ void VISIBLE NORETURN c_handle_instruction_fault(void)
     c_handle_vm_fault(seL4_InstructionFault);
 }
 
-void VISIBLE NORETURN slowpath_irq(void) {
+void VISIBLE NORETURN slowpath_irq(void)
+{
     handleInterruptEntry();
     restore_user_context();
     UNREACHABLE();

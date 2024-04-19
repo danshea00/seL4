@@ -951,7 +951,7 @@ void NORETURN fastpath_irq()
 
     cap_t ntfn_cap = intStateIRQNode[IRQT_TO_IDX(irq)].cap;
     if (unlikely(cap_get_capType(ntfn_cap) != cap_notification_cap ||
-                !cap_notification_cap_get_capNtfnCanSend(ntfn_cap))) {
+                 !cap_notification_cap_get_capNtfnCanSend(ntfn_cap))) {
 #ifdef CONFIG_IRQ_REPORTING
         printf("Undelivered irq: %d\n", (int) IRQT_TO_IRQ(irq));
 #endif
@@ -1006,7 +1006,7 @@ void NORETURN fastpath_irq()
         contextSwitch = false;
     }
 
-     /* Get the bound SC of the signalled thread */
+    /* Get the bound SC of the signalled thread */
     sc = dest->tcbSchedContext;
 
     /* If the signalled thread doesn't have a bound SC, check if one can be
@@ -1059,7 +1059,7 @@ void NORETURN fastpath_irq()
         asid_t asid = cap_vspace_cap_get_capVSMappedASID(newVTable);
         asid_map_t asid_map = findMapForASID(asid);
         if (unlikely(asid_map_get_type(asid_map) != asid_map_asid_map_vspace ||
-                    VSPACE_PTR(asid_map_asid_map_vspace_get_vspace_root(asid_map)) != cap_pd)) {
+                     VSPACE_PTR(asid_map_asid_map_vspace_get_vspace_root(asid_map)) != cap_pd)) {
             slowpath_irq();
         }
 #ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
@@ -1078,11 +1078,6 @@ void NORETURN fastpath_irq()
 #ifdef CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES
     ksKernelEntry.is_fastpath = true;
 #endif
-
-    if (SMP_TERNARY(clh_is_self_in_queue(), 1)) {
-        updateTimestamp();
-        checkBudget();
-    }
 
     if (idle) {
         /* Cancel the IPC that the signalled thread is waiting on */
@@ -1117,14 +1112,21 @@ void NORETURN fastpath_irq()
     }
 
     if (contextSwitch) {
+        updateTimestamp();
+        ticks_t prev = getNextInterrupt();
+
+        if (checkBudget()) {
+            commitTime();
+        }
+
         if (isSchedulable(NODE_STATE(ksCurThread))) {
             SCHED_ENQUEUE_CURRENT_TCB;
         }
         switchToThread_fp(dest, cap_pd, stored_hw_asid);
 
-        if (NODE_STATE(ksReprogram)) {
-            setNextInterrupt();
-            NODE_STATE(ksReprogram) = false;
+        ticks_t next = getNextInterrupt();
+        if (next < prev) {
+            setDeadline(next - getTimerPrecision());
         }
 
         /* update sc */
