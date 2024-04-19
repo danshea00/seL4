@@ -77,9 +77,12 @@ void VISIBLE NORETURN c_handle_interrupt(int irq, int syscall)
         ksKernelEntry.path = Entry_Interrupt;
         ksKernelEntry.word = irq;
 #endif
-        handleInterruptEntry();
-        /* check for other pending interrupts */
-        receivePendingIRQ();
+
+#ifdef CONFIG_IRQ_FASTPATH
+        fastpath_irq();
+#else
+        slowpath_irq();
+#endif
     } else if (irq == int_spurious) {
         /* fall through to restore_user_context and do nothing */
     } else {
@@ -96,6 +99,14 @@ void VISIBLE NORETURN c_handle_interrupt(int irq, int syscall)
 #endif
         handleUnknownSyscall(sys_num);
     }
+    restore_user_context();
+    UNREACHABLE();
+}
+
+void NORETURN slowpath_irq() {
+    handleInterruptEntry();
+    /* check for other pending interrupts */
+    receivePendingIRQ();
     restore_user_context();
     UNREACHABLE();
 }
